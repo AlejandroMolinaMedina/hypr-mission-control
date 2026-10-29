@@ -1,0 +1,28 @@
+# Maintainer: Al3xmm14 <molinaa757@gmail.com>
+
+pkgname=hypr-mission-control-git
+_pkgname=hypr-mission-control
+pkgver=1.0.0.r0.g0000000
+pkgrel=1
+pkgdesc="macOS-style Mission Control overview for Hyprland (plugin): live windows, desktop strip and finger-following gestures"
+arch=('any')
+url="https://github.com/AlejandroMolinaMedina/hypr-mission-control"
+license=('BSD-3-Clause')
+# El plugin se compila en la máquina del usuario, para la versión de Hyprland
+# que corre (ver README): por eso el compilador es dependencia de ejecución
+depends=('hyprland>=0.57' 'gcc' 'make' 'pkgconf' 'jq')
+makedepends=('git')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$_pkgname"
+	git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+}
+
+package() {
+	cd "$_pkgname"
+	make install PREFIX=/usr DESTDIR="$pkgdir"
+}

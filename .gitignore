@@ -1,0 +1,8 @@
+# Compilación de prueba (make build) y paquetes de makepkg
+/build/
+*.so
+*.so.tmp
+/aur/src/
+/aur/pkg/
+/aur/*.pkg.tar.*
+/aur/hypr-mission-control/

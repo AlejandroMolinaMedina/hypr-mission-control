@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# hypr-mission-control: compila el plugin para la versión de Hyprland que está
+# corriendo (si no lo está ya) y lo carga.
+#
+# Un plugin de Hyprland solo carga en la versión exacta para la que se
+# compiló. Por eso no se instala ya compilado: se compila aquí, en tu máquina,
+# y se guarda en ~/.cache/hypr-mission-control/<versión>/. Tras actualizar
+# Hyprland, la versión nueva corre a partir del siguiente inicio de sesión, y
+# entonces este script la compila otra vez (unos segundos).
+#
+# Uso (normalmente desde el arranque de Hyprland):
+#   hypr-mission-control [load]   compilar si hace falta, cargar y recargar la config
+#   hypr-mission-control build    solo compilar
+#   hypr-mission-control unload   descargar
+
+set -u
+
+SELF=$(readlink -f "$0")
+DIR=$(dirname "$SELF")
+
+# Código fuente: junto al script (repo clonado) o el instalado
+if [ -n "${HYPR_MC_SRC:-}" ]; then
+	SRC=$HYPR_MC_SRC
+elif [ -f "$DIR/src/Makefile" ]; then
+	SRC=$DIR/src
+else
+	SRC=$(readlink -f "$DIR/../share/hypr-mission-control/src")
+fi
+
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/hypr-mission-control
+LOG=$CACHE/build.log
+
+avisar() {
+	echo "hypr-mission-control: $1" >&2
+	hyprctl notify 3 10000 "rgb(ff6666)" "Mission Control: $1" >/dev/null 2>&1
+}
+
+cargado() {
+	hyprctl plugin list 2>/dev/null | grep -q "^Plugin missioncontrol "
+}
+
+COMMIT=$(hyprctl version -j 2>/dev/null | jq -r .commit 2>/dev/null)
+if [ -z "$COMMIT" ] || [ "$COMMIT" = null ]; then
+	echo "hypr-mission-control: Hyprland no está corriendo" >&2
+	exit 1
+fi
+SO=$CACHE/$COMMIT/missioncontrol.so
+
+compilar() {
+	# Al día: compilado para esta versión y no más viejo que el código
+	if [ -f "$SO" ] && [ -z "$(find "$SRC" -newer "$SO" -type f 2>/dev/null)" ]; then
+		return 0
+	fi
+
+	# Cabeceras de otra versión que la que corre: se actualizó Hyprland sin
+	# reiniciar la sesión. Compilar ahora daría un plugin que esta no carga
+	local CABECERAS
+	CABECERAS=$(sed -n 's/^#define GIT_COMMIT_HASH *"\(.*\)"/\1/p' /usr/include/hyprland/src/version.h 2>/dev/null)
+	if [ "$CABECERAS" != "$COMMIT" ]; then
+		avisar "Hyprland se ha actualizado: cierra sesión y vuelve a entrar para usarlo"
+		return 1
+	fi
+
+	mkdir -p "$CACHE/$COMMIT"
+	if ! make -C "$SRC" OUT="$SO" >"$LOG" 2>&1; then
+		avisar "no compila con esta versión de Hyprland (detalles en $LOG)"
+		return 1
+	fi
+
+	# Las compilaciones para versiones anteriores ya no sirven
+	find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "$COMMIT" -exec rm -rf {} +
+}
+
+case "${1:-load}" in
+build)
+	compilar
+	;;
+load)
+	compilar || exit 1
+	cargado && exit 0
+	if ! hyprctl plugin load "$SO" >/dev/null; then
+		avisar "no se pudo cargar el plugin"
+		exit 1
+	fi
+	# Las opciones del plugin en la config solo existen ahora que está
+	# cargado: se recarga para que se apliquen
+	hyprctl reload >/dev/null
+	;;
+unload)
+	cargado && hyprctl plugin unload "$SO" >/dev/null
+	;;
+*)
+	echo "uso: hypr-mission-control [load|build|unload]" >&2
+	exit 2
+	;;
+esac
