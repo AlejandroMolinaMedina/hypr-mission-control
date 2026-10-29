@@ -1,0 +1,35 @@
+name: Auto Update README with Custom Docker Gemini
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+
+jobs:
+  update-readme:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/alejandromolinamedina/gemini-cli-docker:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gemini Auto README Action
+        uses: Alexmm14/toolsActions/geminiReadme@master
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: ${{ vars.GEMINI_MODEL }}
+          prompt_url: ${{ vars.PROMPT_URL }}
+          target_branch: 'master'
