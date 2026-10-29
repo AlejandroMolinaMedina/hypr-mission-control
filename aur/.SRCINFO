@@ -1,0 +1,19 @@
+pkgbase = hypr-mission-control-git
+	pkgdesc = macOS-style Mission Control overview for Hyprland (plugin): live windows, desktop strip and finger-following gestures
+	pkgver = 1.0.0.r0.g1b048bc
+	pkgrel = 1
+	url = https://github.com/AlejandroMolinaMedina/hypr-mission-control
+	arch = any
+	license = BSD-3-Clause
+	makedepends = git
+	depends = hyprland>=0.57
+	depends = gcc
+	depends = make
+	depends = pkgconf
+	depends = jq
+	provides = hypr-mission-control
+	conflicts = hypr-mission-control
+	source = git+https://github.com/AlejandroMolinaMedina/hypr-mission-control.git
+	sha256sums = SKIP
+
+pkgname = hypr-mission-control-git

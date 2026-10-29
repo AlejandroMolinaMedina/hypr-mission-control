@@ -2,7 +2,7 @@
 
 pkgname=hypr-mission-control-git
 _pkgname=hypr-mission-control
-pkgver=1.0.0.r0.g0000000
+pkgver=1.0.0.r0.g1b048bc
 pkgrel=1
 pkgdesc="macOS-style Mission Control overview for Hyprland (plugin): live windows, desktop strip and finger-following gestures"
 arch=('any')
