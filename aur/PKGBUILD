@@ -11,6 +11,7 @@ license=('BSD-3-Clause')
 # El plugin se compila en la máquina del usuario, para la versión de Hyprland
 # que corre (ver README): por eso el compilador es dependencia de ejecución
 depends=('hyprland>=0.57' 'gcc' 'make' 'pkgconf' 'jq')
+optdepends=('pacman-contrib: hypr-mission-control check (probar las actualizaciones de Hyprland antes de instalarlas)')
 makedepends=('git')
 provides=("$_pkgname")
 conflicts=("$_pkgname")

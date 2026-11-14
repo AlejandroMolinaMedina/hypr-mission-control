@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# hypr-mc-vps-check: prueba el plugin contra cada versión nueva de Hyprland,
+# pensado para correr con cron en un servidor con Docker (no hace falta Arch).
+#
+#   1. Consulta en archlinux.org la versión de Hyprland de los repos.
+#   2. Si es la misma que la última probada, termina sin hacer nada.
+#   3. Si es nueva, en un contenedor archlinux desechable instala Hyprland (y
+#      todo actualizado, como en un Arch al día), clona el plugin, lo compila y
+#      comprueba que todas las funciones que pide existen en ese Hyprland.
+#   4. Manda un POST al webhook con el resultado:
+#        {"estado": 0, ...}   el plugin compila y enlaza
+#        {"estado": 1, ...}   el plugin no compila o no enlaza
+#      Si la prueba no se pudo hacer (sin red, Docker caído...), no manda nada
+#      y sale con 3: la siguiente ejecución lo vuelve a intentar.
+#
+# Configuración: variables de entorno, o un archivo hypr-mc-vps.conf junto al
+# script (o el que diga HYPR_MC_CONF) con líneas VARIABLE=valor:
+#
+#   WEBHOOK_URL   (obligatoria) URL a la que mandar el resultado
+#   REPO_URL      repo del plugin, o un directorio local con el código
+#                 (por defecto el de GitHub)
+#   REPO_REF      rama, etiqueta o commit (por defecto la rama principal)
+#   STATE_DIR     estado y logs (por defecto ~/.local/state/hypr-mc-vps)
+#   DOCKER        comando de contenedores (por defecto docker)
+#   IMAGE         imagen (por defecto archlinux:latest)
+#   CHOWN_UID/GID dueño de los archivos que deja el contenedor (por defecto el
+#                 usuario que lo ejecuta; con Podman sin root, 0)
+#
+# Uso:
+#   hypr-mc-vps-check            probar si hay versión nueva
+#   hypr-mc-vps-check --force    probar aunque ya se haya probado esta versión
+#
+# Cron (cada 6 horas):
+#   0 */6 * * * /opt/hypr-mc/hypr-mc-vps-check >> /var/log/hypr-mc-vps.log 2>&1
+
+set -u
+
+DIR=$(dirname "$(readlink -f "$0")")
+CONF=${HYPR_MC_CONF:-$DIR/hypr-mc-vps.conf}
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+WEBHOOK_URL=${WEBHOOK_URL:-}
+REPO_URL=${REPO_URL:-https://github.com/AlejandroMolinaMedina/hypr-mission-control.git}
+REPO_REF=${REPO_REF:-}
+STATE_DIR=${STATE_DIR:-$HOME/.local/state/hypr-mc-vps}
+DOCKER=${DOCKER:-docker}
+IMAGE=${IMAGE:-archlinux:latest}
+FORCE=0
+[ "${1:-}" = --force ] && FORCE=1
+
+msg() { echo "[$(date '+%F %T')] $*" >&2; }
+
+if [ -z "$WEBHOOK_URL" ]; then
+	msg "falta WEBHOOK_URL (en el entorno o en $CONF)"
+	exit 2
+fi
+
+mkdir -p "$STATE_DIR"
+
+# Una sola ejecución a la vez (si cron la lanza mientras otra sigue)
+exec 9>"$STATE_DIR/lock"
+if ! flock -n 9; then
+	msg "ya hay una prueba en marcha"
+	exit 0
+fi
+
+# 1. Versión en los repos de Arch
+JSON=$(curl -fsS --max-time 30 https://archlinux.org/packages/extra/x86_64/hyprland/json/) || {
+	msg "no se pudo consultar archlinux.org"
+	exit 3
+}
+campo() { echo "$JSON" | grep -o "\"$1\": *\"\?[^,\"]*" | head -1 | sed 's/.*: *"\?//'; }
+EPOCH=$(campo epoch)
+VERSION="$(campo pkgver)-$(campo pkgrel)"
+[ -n "$EPOCH" ] && [ "$EPOCH" != 0 ] && VERSION="$EPOCH:$VERSION"
+if [ "$VERSION" = "-" ]; then
+	msg "respuesta inesperada de archlinux.org"
+	exit 3
+fi
+
+# 2. ¿Ya probada?
+ULTIMA=$(cat "$STATE_DIR/ultima-version" 2>/dev/null)
+if [ $FORCE -eq 0 ] && [ "$VERSION" = "$ULTIMA" ]; then
+	msg "Hyprland $VERSION ya probado; nada que hacer"
+	exit 0
+fi
+msg "probando Hyprland $VERSION (última probada: ${ULTIMA:-ninguna})"
+
+# 3. Prueba en el contenedor
+OUT=$(mktemp -d "$STATE_DIR/prueba.XXXXXX")
+trap 'rm -rf "$OUT"' EXIT
+
+cat >"$OUT/prueba.sh" <<'CONTENEDOR'
+#!/usr/bin/env bash
+# Corre dentro del contenedor. Sale con 0 y escribe /out/resultado.json si la
+# prueba se hizo (pase o no el plugin); con otro código si no se pudo hacer.
+set -uo pipefail
+exec > >(tee /out/log) 2>&1
+
+terminar() { chown -R "${HOST_UID:-0}:${HOST_GID:-0}" /out 2>/dev/null; }
+trap terminar EXIT
+
+echo "== Instalando Hyprland y el compilador"
+pacman -Syu --noconfirm --needed hyprland gcc make pkgconf git jq binutils || exit 3
+
+HYPRLAND=$(pacman -Q hyprland | awk '{ print $2 }')
+COMMIT_HL=$(sed -n 's/^#define GIT_COMMIT_HASH *"\(.*\)"/\1/p' /usr/include/hyprland/src/version.h)
+echo "== Hyprland $HYPRLAND ($COMMIT_HL)"
+
+echo "== Código del plugin"
+if [ -d /src-host ]; then
+	cp -r /src-host /build || exit 3
+else
+	git clone --quiet "$REPO_URL" /build || exit 3
+	if [ -n "${REPO_REF:-}" ]; then
+		git -C /build checkout --quiet "$REPO_REF" || exit 3
+	fi
+fi
+COMMIT_PLUGIN=$(git -C /build rev-parse --short HEAD 2>/dev/null || echo desconocido)
+echo "   commit $COMMIT_PLUGIN"
+
+ESTADO=0
+MENSAJE="El plugin compila y enlaza con Hyprland $HYPRLAND"
+SO=/tmp/missioncontrol.so
+
+echo "== Compilando"
+if ! make -C /build/src OUT="$SO"; then
+	ESTADO=1
+	MENSAJE="El plugin no compila con Hyprland $HYPRLAND"
+else
+	echo "== Comprobando las funciones que pide el plugin"
+	# Lo que exportan Hyprland y todas sus librerías
+	{
+		nm -D --defined-only /usr/bin/Hyprland
+		ldd /usr/bin/Hyprland | awk '/=>/ { print $3 }' | xargs -r nm -D --defined-only
+	} 2>/dev/null | awk '{ print $3 }' | sed 's/@.*//' | sort -u >/tmp/def
+	# Solo las obligatorias (U); las débiles (w) pueden faltar
+	nm -D --undefined-only "$SO" | awk '$1 == "U" { print $2 }' | sed 's/@.*//' | sort -u >/tmp/und
+	FALTAN=$(comm -23 /tmp/und /tmp/def)
+	if [ -n "$FALTAN" ]; then
+		ESTADO=1
+		MENSAJE="El plugin compila pero no enlaza con Hyprland $HYPRLAND: le faltan $(echo "$FALTAN" | wc -l) funciones"
+		echo "Funciones que faltan:"
+		echo "$FALTAN" | c++filt
+	else
+		echo "   las $(wc -l </tmp/und) funciones existen"
+	fi
+fi
+
+echo "== $MENSAJE"
+jq -n \
+	--argjson estado "$ESTADO" \
+	--arg mensaje "$MENSAJE" \
+	--arg hyprland "$HYPRLAND" \
+	--arg hyprland_commit "$COMMIT_HL" \
+	--arg plugin_commit "$COMMIT_PLUGIN" \
+	--arg fecha "$(date -u +%FT%TZ)" \
+	--rawfile log /out/log \
+	'{estado: $estado, mensaje: $mensaje, hyprland: $hyprland,
+	  hyprland_commit: $hyprland_commit, plugin_commit: $plugin_commit,
+	  fecha: $fecha, log: ($log | split("\n") | .[-60:] | join("\n"))}' \
+	>/out/resultado.json
+CONTENEDOR
+
+MONTAR=()
+if [ -d "$REPO_URL" ]; then
+	MONTAR=(-v "$(readlink -f "$REPO_URL"):/src-host:ro")
+fi
+
+# shellcheck disable=SC2086
+$DOCKER pull -q "$IMAGE" >/dev/null 2>&1 || msg "no se pudo actualizar la imagen $IMAGE; se usa la que haya"
+# shellcheck disable=SC2086
+$DOCKER run --rm \
+	-v "$OUT:/out" "${MONTAR[@]}" \
+	-e REPO_URL="$REPO_URL" -e REPO_REF="$REPO_REF" \
+	-e HOST_UID="${CHOWN_UID:-$(id -u)}" -e HOST_GID="${CHOWN_GID:-$(id -g)}" \
+	"$IMAGE" bash /out/prueba.sh
+RC=$?
+
+cp -f "$OUT/log" "$STATE_DIR/ultimo.log" 2>/dev/null
+
+if [ $RC -ne 0 ] || [ ! -s "$OUT/resultado.json" ]; then
+	msg "la prueba no se pudo hacer (código $RC); se reintentará. Log: $STATE_DIR/ultimo.log"
+	exit 3
+fi
+
+# 4. Webhook
+ESTADO=$(grep -o '"estado": *[0-9]*' "$OUT/resultado.json" | grep -o '[0-9]*$')
+PROBADA=$(grep -o '"hyprland": *"[^"]*"' "$OUT/resultado.json" | sed 's/.*"\([^"]*\)"$/\1/')
+msg "resultado: estado $ESTADO (Hyprland $PROBADA)"
+
+# El mirror del contenedor aún no tiene la versión nueva y esta ya se avisó
+if [ $FORCE -eq 0 ] && [ "$PROBADA" = "$ULTIMA" ]; then
+	msg "el mirror aún no tiene Hyprland $VERSION (instaló $PROBADA, ya avisada); se reintentará"
+	exit 0
+fi
+
+if ! curl -fsS --max-time 30 -X POST -H 'Content-Type: application/json' \
+	--data-binary "@$OUT/resultado.json" "$WEBHOOK_URL" >/dev/null; then
+	msg "no se pudo mandar el webhook; se reintentará"
+	exit 3
+fi
+cp -f "$OUT/resultado.json" "$STATE_DIR/ultimo-resultado.json"
+
+# Se guarda la versión que se probó de verdad (el mirror del contenedor puede
+# ir por detrás de archlinux.org: entonces la próxima ejecución vuelve a probar)
+echo "$PROBADA" >"$STATE_DIR/ultima-version"
+msg "webhook enviado"
+exit 0

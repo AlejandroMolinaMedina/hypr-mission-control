@@ -1,0 +1,11 @@
+# Copia este archivo como hypr-mc-vps.conf, junto al script.
+
+# Obligatoria: a dónde mandar el resultado ({"estado": 0|1, ...})
+WEBHOOK_URL=https://tu-n8n.ejemplo.com/webhook/hypr-mission-control
+
+# Opcionales (estos son los valores por defecto)
+#REPO_URL=https://github.com/AlejandroMolinaMedina/hypr-mission-control.git
+#REPO_REF=
+#STATE_DIR=$HOME/.local/state/hypr-mc-vps
+#DOCKER=docker
+#IMAGE=archlinux:latest
