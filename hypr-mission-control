@@ -9,9 +9,12 @@
 # entonces este script la compila otra vez (unos segundos).
 #
 # Uso (normalmente desde el arranque de Hyprland):
-#   hypr-mission-control [load]   compilar si hace falta, cargar y recargar la config
-#   hypr-mission-control build    solo compilar
-#   hypr-mission-control unload   descargar
+#   hypr-mission-control [load]          compilar si hace falta, cargar y recargar la config
+#   hypr-mission-control build           solo compilar
+#   hypr-mission-control unload          descargar
+#   hypr-mission-control check           probar el plugin contra las
+#                                        actualizaciones pendientes de Hyprland
+#                                        (sin instalarlas; ver comprobar())
 
 set -u
 
@@ -29,6 +32,8 @@ fi
 
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/hypr-mission-control
 LOG=$CACHE/build.log
+# Estado de check: dentro de la caché, pero compilar() no lo borra
+CHECK=$CACHE/check
 
 avisar() {
 	echo "hypr-mission-control: $1" >&2
@@ -39,12 +44,14 @@ cargado() {
 	hyprctl plugin list 2>/dev/null | grep -q "^Plugin missioncontrol "
 }
 
-COMMIT=$(hyprctl version -j 2>/dev/null | jq -r .commit 2>/dev/null)
-if [ -z "$COMMIT" ] || [ "$COMMIT" = null ]; then
-	echo "hypr-mission-control: Hyprland no está corriendo" >&2
-	exit 1
-fi
-SO=$CACHE/$COMMIT/missioncontrol.so
+version_corriendo() {
+	COMMIT=$(hyprctl version -j 2>/dev/null | jq -r .commit 2>/dev/null)
+	if [ -z "$COMMIT" ] || [ "$COMMIT" = null ]; then
+		echo "hypr-mission-control: Hyprland no está corriendo" >&2
+		exit 1
+	fi
+	SO=$CACHE/$COMMIT/missioncontrol.so
+}
 
 compilar() {
 	# Al día: compilado para esta versión y no más viejo que el código
@@ -68,14 +75,256 @@ compilar() {
 	fi
 
 	# Las compilaciones para versiones anteriores ya no sirven
-	find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "$COMMIT" -exec rm -rf {} +
+	find "$CACHE" -mindepth 1 -maxdepth 1 -type d ! -name "$COMMIT" ! -name check -exec rm -rf {} +
+}
+
+# ============================================================================
+# check: ¿compilará el plugin con la actualización pendiente?
+#
+# Sin instalar nada ni pedir root:
+#   1. Busca actualizaciones con checkupdates (base de datos propia en la caché).
+#   2. Se queda con las que pueden cambiar la compilación: Hyprland y los
+#      paquetes dueños de alguna cabecera que usa el plugin (sin el
+#      compilador ni glibc: esos no se pueden probar sin instalarlos).
+#   3. Las descarga (o las toma de la caché de pacman o de una prueba
+#      anterior), comprueba su SHA-256 con la base de datos y las extrae en un
+#      directorio temporal.
+#   4. Compila el plugin contra esas cabeceras, comprueba que no se coló
+#      ninguna de las instaladas y que todas las funciones que el plugin pide
+#      existen en el Hyprland nuevo y sus librerías.
+#   5. Muestra el resultado. El detalle queda en ~/.cache/hypr-mission-control/check/check.log
+#
+# Salida: 0 bien o nada que probar, 1 el plugin no compila o no enlaza con la
+# actualización, 3 no se pudo hacer la prueba (red, mirror, fallo de la prueba).
+# ============================================================================
+
+log() { echo "$*" | tee -a "$CHECK_LOG" >&2; }
+
+# Descarga $1 (URL de pacman) a $2, probando los demás mirrors si el primero
+# falla o va demasiado lento
+descargar() {
+	local URL=$1 DEST=$2 REPO ARCHIVO M
+	ARCHIVO=${URL##*/}
+	REPO=$(echo "$URL" | sed -nE 's#.*/([^/]+)/os/[^/]+/[^/]+$#\1#p')
+	{
+		echo "$URL"
+		grep -E '^\s*Server\s*=' /etc/pacman.d/mirrorlist 2>/dev/null |
+			sed -E 's/^\s*Server\s*=\s*//' |
+			sed -e "s#\$repo#$REPO#g" -e "s#\$arch#x86_64#g" -e "s#\$#/$ARCHIVO#"
+	} | awk '!vistos[$0]++' | head -6 | while read -r M; do
+		log "  descargando $M"
+		# Aborta si baja de 50 KB/s durante 30 s y prueba el siguiente
+		if curl -fsSL --connect-timeout 15 --speed-limit 51200 --speed-time 30 \
+			-o "$DEST.part" "$M"; then
+			mv -f "$DEST.part" "$DEST"
+			break
+		fi
+		rm -f "$DEST.part"
+	done
+	[ -f "$DEST" ]
+}
+
+# SHA-256 del paquete según la base de datos sincronizada
+sha_esperado() { # db nombre-versión
+	bsdtar -xOf "$1" "$2/desc" 2>/dev/null | awk 'f { print; exit } /^%SHA256SUM%$/ { f = 1 }'
+}
+
+# Todas las funciones que exportan un binario y sus librerías (recursivo,
+# leyendo NEEDED con readelf: no ejecuta nada del paquete descargado)
+simbolos_definidos() { # binario directorio-de-librerías-nuevas
+	local -a pendientes=("$1") vistos=()
+	local f lib ruta
+	while [ ${#pendientes[@]} -gt 0 ]; do
+		f=${pendientes[0]}
+		pendientes=("${pendientes[@]:1}")
+		case " ${vistos[*]-} " in *" $f "*) continue ;; esac
+		vistos+=("$f")
+		nm -D --defined-only "$f" 2>/dev/null | awk '{ print $3 }'
+		for lib in $(readelf -d "$f" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+			ruta=
+			[ -e "$2/$lib" ] && ruta=$(readlink -f "$2/$lib")
+			[ -z "$ruta" ] && [ -e "/usr/lib/$lib" ] && ruta=$(readlink -f "/usr/lib/$lib")
+			[ -n "$ruta" ] && pendientes+=("$ruta")
+		done
+	done
+}
+
+# Cabeceras que usa el plugin al compilar (rutas absolutas, normalizadas),
+# con el PKG_CONFIG_PATH que haya en ese momento
+cabeceras_incluidas() {
+	local DEPS_PC
+	DEPS_PC=$(sed -n 's/^DEPS *= *//p' "$SRC/Makefile")
+	# shellcheck disable=SC2046,SC2086
+	(cd "$SRC" && g++ -std=c++2b -Wno-narrowing -M ./*.cpp $(pkg-config --cflags $DEPS_PC)) |
+		tr ' ' '\n' | grep '^/' | xargs -r realpath -eq | sort -u
+}
+
+# El compilador y la biblioteca de C se usan los instalados: no se prueban
+SIN_PROBAR=" gcc gcc-libs glibc linux-api-headers "
+
+comprobar() {
+	mkdir -p "$CHECK/pkgs"
+	local DB=$CHECK/db
+	CHECK_LOG=$CHECK/check.log
+
+	# 1. Actualizaciones pendientes (checkupdates: 0 hay, 2 no hay, otro error)
+	local PENDIENTES RC
+	PENDIENTES=$(CHECKUPDATES_DB=$DB checkupdates 2>"$CHECK/checkupdates.err")
+	RC=$?
+	if [ $RC -eq 2 ]; then
+		echo "No hay actualizaciones pendientes." >&2
+		return 0
+	elif [ $RC -ne 0 ]; then
+		echo "hypr-mission-control: checkupdates falló: $(cat "$CHECK/checkupdates.err")" >&2
+		return 3
+	fi
+
+	# 2. Hyprland y los dueños de las cabeceras que usa el plugin
+	local DEPS NOMBRE NUEVA RELEVANTES=() CLAVE=
+	DEPS=" hyprland $(cabeceras_incluidas 2>/dev/null | grep '^/usr/include/' |
+		xargs -r pacman -Qqo 2>/dev/null | sort -u | tr '\n' ' ') "
+	while read -r NOMBRE _ _ NUEVA; do
+		[ -z "$NOMBRE" ] && continue
+		case "$DEPS" in *" $NOMBRE "*) ;; *) continue ;; esac
+		case "$SIN_PROBAR" in *" $NOMBRE "*) continue ;; esac
+		RELEVANTES+=("$NOMBRE")
+		CLAVE+="$NOMBRE-$NUEVA "
+	done <<<"$PENDIENTES"
+
+	if [ ${#RELEVANTES[@]} -eq 0 ]; then
+		echo "Hay actualizaciones pendientes, pero ninguna afecta al plugin." >&2
+		return 0
+	fi
+
+	local WORK
+	WORK=$(mktemp -d "$CHECK/prueba.XXXXXX")
+	# shellcheck disable=SC2064
+	trap "rm -rf '$WORK'" EXIT
+	mkdir -p "$WORK/root" "$WORK/pc"
+	: >"$CHECK_LOG"
+	log "== $(date '+%F %T')  probando: $CLAVE"
+
+	# 3. Descargar, verificar y extraer
+	local URLS URL ARCHIVO SHA REPO NV
+	URLS=$(pacman -Sp -dd --dbpath "$DB" --logfile /dev/null "${RELEVANTES[@]}" 2>>"$CHECK_LOG" | grep '://')
+	if [ -z "$URLS" ]; then
+		log "no se pudieron obtener las URLs de los paquetes"
+		return 3
+	fi
+	# Los paquetes se guardan en $CHECK/pkgs: repetir la prueba no los vuelve
+	# a descargar. Los de pruebas anteriores que ya no hacen falta se borran
+	local -a USADOS=()
+	for URL in $URLS; do
+		ARCHIVO=${URL##*/}
+		USADOS+=("$ARCHIVO")
+		REPO=$(echo "$URL" | sed -nE 's#.*/([^/]+)/os/[^/]+/[^/]+$#\1#p')
+		NV=$(echo "$ARCHIVO" | sed -E 's/-[^-]+\.pkg\.tar\.[a-z0-9]+$//')
+		SHA=$(sha_esperado "$DB/sync/$REPO.db" "$NV")
+		if [ -z "$SHA" ]; then
+			log "$ARCHIVO: no está en la base de datos de pacman"
+			return 3
+		fi
+		sha_ok() { [ -f "$1" ] && [ "$(sha256sum "$1" | awk '{ print $1 }')" = "$SHA" ]; }
+
+		if sha_ok "$CHECK/pkgs/$ARCHIVO"; then
+			log "  $ARCHIVO: ya descargado"
+		elif sha_ok "/var/cache/pacman/pkg/$ARCHIVO"; then
+			cp "/var/cache/pacman/pkg/$ARCHIVO" "$CHECK/pkgs/"
+			log "  $ARCHIVO: de la caché de pacman"
+		else
+			rm -f "$CHECK/pkgs/$ARCHIVO"
+			if ! descargar "$URL" "$CHECK/pkgs/$ARCHIVO"; then
+				log "no se pudo descargar $ARCHIVO"
+				return 3
+			fi
+			if ! sha_ok "$CHECK/pkgs/$ARCHIVO"; then
+				rm -f "$CHECK/pkgs/$ARCHIVO"
+				log "$ARCHIVO: el SHA-256 no coincide con la base de datos de pacman"
+				return 3
+			fi
+		fi
+		bsdtar -xf "$CHECK/pkgs/$ARCHIVO" -C "$WORK/root" --exclude '.*' usr 2>>"$CHECK_LOG"
+	done
+	local F
+	for F in "$CHECK"/pkgs/*; do
+		[ -e "$F" ] || continue
+		case " ${USADOS[*]} " in *" ${F##*/} "*) ;; *) rm -f "$F" ;; esac
+	done
+
+	# .pc apuntando al directorio temporal: van primero en PKG_CONFIG_PATH
+	local PC
+	for PC in "$WORK"/root/usr/lib/pkgconfig/*.pc "$WORK"/root/usr/share/pkgconfig/*.pc; do
+		[ -f "$PC" ] || continue
+		sed -E "s#^([A-Za-z_]+)=/usr#\1=$WORK/root/usr#" "$PC" >"$WORK/pc/${PC##*/}"
+	done
+	export PKG_CONFIG_PATH=$WORK/pc${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
+
+	# 4a. Compilar
+	local SO_PRUEBA=$WORK/missioncontrol.so FALLO=
+	log "-- compilando"
+	if ! make -C "$SRC" OUT="$SO_PRUEBA" >>"$CHECK_LOG" 2>&1; then
+		FALLO="no compila"
+	fi
+
+	# 4b. Que no se colara ninguna cabecera instalada que la actualización
+	# cambia (la misma ruta existe en los paquetes nuevos)
+	local PRUEBA_MAL=
+	if [ -z "$FALLO" ]; then
+		local INCLUIDAS VIEJAS= H NUEVAS
+		INCLUIDAS=$(cabeceras_incluidas 2>>"$CHECK_LOG")
+		for H in $(echo "$INCLUIDAS" | grep '^/usr/include/'); do
+			[ -e "$WORK/root$H" ] && VIEJAS+="$H"$'\n'
+		done
+		NUEVAS=$(echo "$INCLUIDAS" | grep -c "^$WORK/root/")
+		if [ -n "$VIEJAS" ]; then
+			log "usó cabeceras instaladas en vez de las nuevas:"
+			log "$VIEJAS"
+			PRUEBA_MAL=1
+		else
+			log "-- cabeceras: las $NUEVAS que cambian con la actualización son las nuevas"
+		fi
+	fi
+
+	# 4c. Funciones que pide el plugin
+	if [ -z "$FALLO" ] && [ -z "$PRUEBA_MAL" ]; then
+		local BIN=/usr/bin/Hyprland FALTAN
+		[ -x "$WORK/root/usr/bin/Hyprland" ] && BIN=$WORK/root/usr/bin/Hyprland
+		simbolos_definidos "$BIN" "$WORK/root/usr/lib" | sed 's/@.*//' | sort -u >"$WORK/def"
+		# Solo las obligatorias (U); las débiles (w) pueden faltar
+		nm -D --undefined-only "$SO_PRUEBA" | awk '$1 == "U" { print $2 }' | sed 's/@.*//' | sort -u >"$WORK/und"
+		FALTAN=$(comm -23 "$WORK/und" "$WORK/def")
+		if [ -n "$FALTAN" ]; then
+			log "funciones que el plugin pide y el Hyprland nuevo no tiene:"
+			log "$(echo "$FALTAN" | c++filt)"
+			FALLO="no enlaza"
+		else
+			log "-- funciones: las $(wc -l <"$WORK/und") que pide el plugin existen"
+		fi
+	fi
+
+	# 5. Resultado
+	local ESTADO MENSAJE
+	if [ -n "$FALLO" ]; then
+		ESTADO=1
+		MENSAJE="FALLA: el plugin $FALLO con la actualización. Mejor no actualizar todavía (detalles en $CHECK_LOG)."
+	elif [ -n "$PRUEBA_MAL" ]; then
+		ESTADO=3
+		MENSAJE="SIN COMPROBAR: falló la propia prueba, no el plugin (detalles en $CHECK_LOG)."
+	else
+		ESTADO=0
+		MENSAJE="OK: el plugin compila con la actualización. Puedes actualizar y, después, cerrar sesión y volver a entrar."
+	fi
+	log "== $MENSAJE"
+	return $ESTADO
 }
 
 case "${1:-load}" in
 build)
+	version_corriendo
 	compilar
 	;;
 load)
+	version_corriendo
 	compilar || exit 1
 	cargado && exit 0
 	if ! hyprctl plugin load "$SO" >/dev/null; then
@@ -87,10 +336,14 @@ load)
 	hyprctl reload >/dev/null
 	;;
 unload)
+	version_corriendo
 	cargado && hyprctl plugin unload "$SO" >/dev/null
 	;;
+check)
+	comprobar
+	;;
 *)
-	echo "uso: hypr-mission-control [load|build|unload]" >&2
+	echo "uso: hypr-mission-control [load|build|unload|check]" >&2
 	exit 2
 	;;
 esac

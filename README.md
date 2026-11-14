@@ -60,4 +60,11 @@ Este proyecto es de código abierto. Si deseas contribuir:
 2. Crea una rama para tu funcionalidad (`git checkout -b feature/nueva-funcionalidad`).
 3. Realiza tus cambios y envía un Pull Request.
 
+## Probar antes de actualizar Hyprland
+
+Un plugin de Hyprland puede dejar de compilar con una versión nueva. Hay dos formas de saberlo antes de actualizar:
+
+* **En tu Arch:** `hypr-mission-control check` descarga (sin instalar) las actualizaciones pendientes de Hyprland y de los paquetes cuyas cabeceras usa el plugin, compila el plugin contra ellas y comprueba que todas las funciones que pide existen en el Hyprland nuevo. Muestra `OK`, `FALLA` o `SIN COMPROBAR` (salida 0, 1 o 3); el detalle queda en `~/.cache/hypr-mission-control/check/check.log`. Necesita `pacman-contrib`.
+* **En un servidor con Docker, con cron:** `vps/hypr-mc-vps-check` prueba cada versión nueva de Hyprland en un contenedor `archlinux` y manda el resultado a un webhook (`{"estado": 0}` bien, `{"estado": 1}` falla). Ver [vps/README.md](./vps/README.md).
+
 Consulta el archivo [LICENSE](./LICENSE) para conocer los detalles sobre los términos de uso y distribución de este software.
